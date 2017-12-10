@@ -40,6 +40,9 @@ struct Paint:Equatable {
         return PaintComparison.noMatch
     }
     
+    func uniqueID()->String{
+        return "\(color):\(finish)"
+    }
     
 }
 
@@ -51,32 +54,48 @@ struct Customer:Equatable {
     static func ==(lhs: Customer, rhs: Customer) -> Bool {
         return lhs.uniqueID == rhs.uniqueID
     }
+    
+    func wantsSinglePaint()->Bool{
+        return (requirements.count == 1)
+    }
+    
+    func paintAt(_ index:Int)->Paint{
+        return requirements[index]
+    }
 }
 
 
 struct PaintMix {
-    var candidate:[Finish]
+    var paints:[Paint]
     
-    mutating func replacePaint(paint:Paint){
-       candidate[paint.color.rawValue] = paint.finish
+    mutating func replace(_ paint:Paint){
+       paints[paint.color.rawValue] = paint
     }
+    func uniqueID()->String{
+        var result = ""
+        for paint in paints {
+            result += paint.uniqueID()
+        }
+        return result;
+    }
+
 }
 
 struct Solution {
-    var candidate:PaintMix?
+    var paintMix:PaintMix
     var error = ""
+    var needsToReset = false
     
-    // an array of paints that cannot change, for instance if a customer only wants 1G, that is locked. Any attempt to change it wil cause an error
-    var fufilledPaints:[Paint] // indices into the paints that cannot ever be changed
- 
-    var fufilledCustomers:[Customer]    // a customer who has caused a fufilled paint(s)
-    
-    var failedPaintMixes:[PaintMix]? // previously tried paints
+    // an array of paints that cannot change, for instance if a customer only wants one paint 1G, that is locked. Any attempt to change it wil cause an error
+    var fulfilledPaints:[Paint] // indices into the paints that cannot ever be changed
+    var fulfilledCustomers:[Customer]    // a customer who has caused a fufilled paint(s) and cant be changed
+    var tempFufilledCustomers:[Customer] // customers who were fufilled by the most recent candidate
+    var failedPaintMixes:[String:PaintMix] // previously tried paint mixes that didnt succeed for all customers
     
     func fufilledPaintFor(_ color:Color)->Paint?{
         var result:Paint? = nil
         
-        for paint in fufilledPaints {
+        for paint in fulfilledPaints {
             if (paint.color == color){
                 result = paint
                 break
@@ -85,15 +104,39 @@ struct Solution {
         return result
     }
     
- func add(paint:Paint, toCandidate candidate:PaintMix)throws{
-        var candidate = candidate
-        candidate.replacePaint(paint: paint)
+    mutating func addToFufilledList(customer:Customer, paint:Paint) {
+        fulfilledPaints.append(paint)
+        fulfilledCustomers.append(customer)
+    }
+    
+    mutating func addToFailed(_ failedMix:PaintMix){
+        failedPaintMixes[failedMix.uniqueID()] = failedMix
+    }
+    
+    private func hasFailed(paintMix:PaintMix)->Bool{
+        return (failedPaintMixes[paintMix.uniqueID()] != nil)
+    }
+    
+    private func paintMixByReplacing(paint:Paint)->PaintMix{
+        var paintMixNew = paintMix
+        paintMixNew.replace(paint)
+        return paintMix
+    }
+    
+    func failedAlready(_ paint:Paint)->Bool{
+        let paintMix = paintMixByReplacing(paint: paint)
+        return hasFailed(paintMix: paintMix)
+    }
+    
+    mutating func add(_ paint:Paint)throws{
+        paintMix.replace(paint)
     }
     
 }
 
 enum SolutionError: Error {
     case solutionImpossible
+    case solutionFailed
 }
 
 enum ParsingError:Error {
@@ -115,11 +158,13 @@ struct Solver {
     var candidate:[PaintMix]
     let failureText = "No optimal solution"
     
-    func getOriginalCandidate(_ numberOfColors:Int)->[Finish]{
-        var result:[Finish] = []
+    func getOriginalCandidate(_ numberOfColors:Int)->[Paint]{
+        var result:[Paint] = []
         
-        for _ in 1...numberOfColors{
-            result.append(Finish.Gloss)
+        for index in 0...numberOfColors{
+            if let  color = Color(rawValue: index) {
+                result.append(Paint(color: color, finish: Finish.Gloss))
+            }
         }
         
         return result
@@ -128,77 +173,104 @@ struct Solver {
     
     fileprivate func solveForMultiplePaints( _ customer: Customer, _ existingSolution: Solution) throws -> Solution {
         
-        var potentialSolution = existingSolution
-        
-        
         guard  customer.requirements.count > 0 else {
             throw  InputError.customerWithNoPaints
         }
         
-        let paint = customer.requirements[0]
+        var potentialSolution = existingSolution
+        let storedPaintMix = existingSolution.paintMix
         
-        guard paint.color.rawValue < customer.requirements.count else {
-            throw  ParsingError.invalidCustomerIndex
+        let notFufilledPaints = existingSolution.paintMix.paints.filter { (paint) -> Bool in
+            return (potentialSolution.fufilledPaintFor(paint.color) == nil)
         }
         
+        let fufilledPaints = existingSolution.paintMix.paints.filter { (paint) -> Bool in
+            return (potentialSolution.fufilledPaintFor(paint.color) != nil)
+        }
         
-        if let candidate = existingSolution.candidate{
-            if (potentialSolution.fufilledPaints.contains(paint) == false){
-                // we dont have an equivalent paint but do we have an equivalent color, with a potential conflict?
-                if let satisifedPaint = potentialSolution.fufilledPaintFor(paint.color){
-                    // if so throw
-                    if (satisifedPaint.finish != paint.finish) {
-                        throw SolutionError.solutionImpossible
-                    } else {
-                        // if not then we can add this paint and customer as satisifed
-                        potentialSolution.fufilledPaints.append(paint)
-                        potentialSolution.fufilledCustomers.append(customer)
-                        potentialSolution.candidate = candidate
-                    }
+        var customerHadOneOption = false
+        var replacedOrFoundPaint = false
+        var changedPaint:Paint? = nil
+        
+        for index in 0...notFufilledPaints.count-1{
+            customerHadOneOption = index == notFufilledPaints.count-1
+            
+            let candidatePaint = notFufilledPaints[index]
+            let customerPaint = customer.paintAt(index)
+            if (candidatePaint != customerPaint){
+                if (potentialSolution.failedAlready(customerPaint) == false){
+                    try potentialSolution.add(customerPaint)
+                    potentialSolution.addToFailed(storedPaintMix)
+                    changedPaint = customerPaint
+                    replacedOrFoundPaint = true
+                    break
+                }
+            }
+        }
+        
+        if (replacedOrFoundPaint == true){
+            if (customerHadOneOption){
+                if let customerPaint = changedPaint{
+                    // this customer had to change a paint, and only one paint satisifed.
+                    // That paint and the customer are now locked.
+                    potentialSolution.addToFufilledList(customer: customer, paint: customerPaint)
+                }
+            }
+            potentialSolution.needsToReset = true
+        } else {
+            var foundMatch = false
+            for index in 0...fufilledPaints.count-1{
+                customerHadOneOption = index == notFufilledPaints.count-1
+                
+                let changablePaint = notFufilledPaints[index]
+                let customerPaint = customer.paintAt(index)
+                if (changablePaint == customerPaint){
+                   foundMatch = true
+                    break
                 }
             }
             
-            // if it does exist in that list we dont have to change it.
+            if (foundMatch == false){
+                throw SolutionError.solutionImpossible
+            }
         }
+        
         
         return potentialSolution
         
     }
   
 fileprivate func solveForSinglePaint( _ customer: Customer, _ existingSolution: Solution) throws -> Solution {
-        
-        var potentialSolution = existingSolution
-    
-    
-        guard  customer.requirements.count > 0 else {
-            throw  InputError.customerWithNoPaints
-        }
-    
-        let paint = customer.requirements[0]
+    guard  customer.requirements.count > 0 else {
+        throw  InputError.customerWithNoPaints
+    }
+    var potentialSolution = existingSolution
+    let paint = customer.requirements[0]
 
-        guard paint.color.rawValue < customer.requirements.count else {
-            throw  ParsingError.invalidCustomerIndex
-        }
+    guard paint.color.rawValue < customer.requirements.count else {
+        throw  ParsingError.invalidCustomerIndex
+    }
     
-
-        if let candidate = existingSolution.candidate{
-            if (potentialSolution.fufilledPaints.contains(paint) == false){
-                // we dont have an equivalent paint but do we have an equivalent color, with a potential conflict?
-                if let satisifedPaint = potentialSolution.fufilledPaintFor(paint.color){
-                    // if so throw
-                    if (satisifedPaint.finish != paint.finish) {
-                        throw SolutionError.solutionImpossible
-                    } else {
-                        // if not then we can add this paint and customer as satisifed
-                        potentialSolution.fufilledPaints.append(paint)
-                        potentialSolution.fufilledCustomers.append(customer)
-                        potentialSolution.candidate = candidate
-                    }
-                }
+    if (potentialSolution.fulfilledPaints.contains(paint) == true){
+        // this customer is fufilled already by his paint and that cant change so lets not try him again
+        potentialSolution.fulfilledCustomers.append(customer)
+    } else {
+        // we dont have an equivalent paint for this guy
+        // a paint contains color and finish, do we have a color at this index
+        if let satisifedPaint = potentialSolution.fufilledPaintFor(paint.color){
+            //  we have a fufilled color for this paint which cant change
+            if (satisifedPaint.finish != paint.finish) {
+                // but the finish is different
+                throw SolutionError.solutionImpossible
             }
-            
-            // if it does exist in that list we dont have to change it.
+        } else {
+            // no paint or color exists at this position
+            try potentialSolution.add(paint)
+            potentialSolution.fulfilledPaints.append(paint)
+            potentialSolution.fulfilledCustomers.append(customer)
         }
+    }
+            // if it does exist in that list we dont have to change it.
     
         return potentialSolution
     
@@ -208,8 +280,7 @@ fileprivate func solveForSinglePaint( _ customer: Customer, _ existingSolution: 
     
   
     
-
-func solveFor(potentialSolution:Solution?, _ customers:[Customer], numberOfColors:Int) throws -> Solution{
+fileprivate func solveFor(potentialSolution:Solution?, _ customers:[Customer], numberOfColors:Int) throws -> Solution{
         
         var solutionOpt:Solution? = nil
         
@@ -218,9 +289,9 @@ func solveFor(potentialSolution:Solution?, _ customers:[Customer], numberOfColor
             let startingPaints = getOriginalCandidate(numberOfColors)
             
             // lets sort the customers by their smaller requirement
-            let candidate = PaintMix(candidate: startingPaints)
+            let candidate = PaintMix(paints: startingPaints)
             
-            solutionOpt = Solution(candidate: candidate, error: "", fufilledPaints: [], fufilledCustomers: [], failedPaintMixes: [])
+            solutionOpt = Solution(paintMix: candidate, error: "", needsToReset: false, fulfilledPaints: [], fulfilledCustomers: [], tempFufilledCustomers: [], failedPaintMixes: [:])
             
             
         } else {
@@ -228,45 +299,44 @@ func solveFor(potentialSolution:Solution?, _ customers:[Customer], numberOfColor
         }
         
         var solution = solutionOpt!
-   
-        
-        let customers = customers.sorted { (c1, c2) -> Bool in
+    
+    // we just need to parse the customers that are not already locked down
+    // a fufilled customer is one who has requirements met because one fufilled paint
+    // matches his requirements and needs to be there
+        let notSatisfiedCustomers = customers.filter { (customer) -> Bool in
+            return (solution.fulfilledCustomers.contains(customer) == false)
+        }
+    
+    // sort the customers by size of paints to better handle customers with one paint requirement
+    // customers with one paint requirement generate a fufilled paint immediately and become fufilled customers immediately, or if there is a conflict cause an exception immediately
+        let customers = notSatisfiedCustomers.sorted { (c1, c2) -> Bool in
             return (c1.requirements.count <= c2.requirements.count)
         }
-        
+    
+        var needsToReset = true
+    
         for customer in customers {
-            if (customer.requirements.count == 1) && (solution.fufilledCustomers.contains(customer) == false){
+            if (customer.wantsSinglePaint()){
                 solution = try solveForSinglePaint(customer, solution)
             } else {
-                
+                solution = try solveForMultiplePaints(customer, solution)
+                if (solution.needsToReset == true){
+                    needsToReset = true
+                    break
+                }
             }
         }
-        
-        // get all customers who want one paint lock down the indices
-        // if all indices are locked then try all available customers
-        // for each single customer with only one option
-        // does this solution satisfy
-        // if it does continue
-        // if it doesnt then
-        // if there is only option to change ignoring locked indices then call  solveForCustomersWithOneOption and restart *
-        // if there are more degrees of freedom then change the first index that is g, else M
-        // If nothing can be changed throw.
-        
-        
-        
-        
-        
-        // * optimize by not restarting if the locked customers are the same as the visited customers.
-        
+    
+        if needsToReset == true{
+            solution.needsToReset = false
+            solution.tempFufilledCustomers = []
+            solution = try solveFor(potentialSolution: solution, customers, numberOfColors: numberOfColors)
+        }
+    
+    
         return solution
 
-        
     }
-    
-  
-    
-   
-    
 }
 
 
